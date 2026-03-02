@@ -1,12 +1,16 @@
 """
 Streamlit dashboard for STDF DB: lot-to-lot, wafer-to-wafer, die-to-die analysis,
-fail pareto, TestSuite→TestItem mapping, wafer diff comparison, bin summary, equipment.
+fail pareto, TestSuite→TestItem mapping, wafer diff comparison, bin summary, equipment, LLM assistant.
 """
 import io
+import os
+import json
+import re
 import tempfile
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, date, timedelta
+from typing import List, Dict, Any
 
 import pandas as pd
 import numpy as np
@@ -89,6 +93,115 @@ def _p_chart(subgroup_labels, defect_counts, total_counts, title="p-Chart (Propo
     return fig
 
 
+def build_lot_pchart_figure(session: Session, lot_ids: List[str]):
+    """
+    Build p-chart figure for given lot_ids (proportion defective per lot).
+    Used by both Lot-to-Lot page and LLM assistant.
+    """
+    if not lot_ids:
+        return None
+    lots = session.query(Lot).filter(Lot.lot_id.in_(lot_ids)).all()
+    if not lots:
+        return None
+    labels: List[str] = []
+    total_counts: List[int] = []
+    fail_counts: List[int] = []
+    for lot in lots:
+        total = session.query(Die).filter_by(lot_id=lot.id).count()
+        if total == 0:
+            continue
+        fails = session.query(Die.id).join(TestItem, TestItem.die_id == Die.id).filter(
+            Die.lot_id == lot.id, TestItem.pass_fail == 1
+        ).distinct().count()
+        labels.append(lot.lot_id)
+        total_counts.append(total)
+        fail_counts.append(fails)
+    if not labels:
+        return None
+    return _p_chart(labels, fail_counts, total_counts, title="p-Chart: Proportion defective per Lot")
+
+
+def build_wafer_map_figure(session: Session, lot_id: str, wafer_id: str):
+    """
+    Build wafer map (by hard_bin) for given lot_id and wafer_id.
+    Used by LLM assistant.
+    """
+    if not lot_id or not wafer_id:
+        return None
+    lot = session.query(Lot).filter_by(lot_id=lot_id).first()
+    if not lot:
+        return None
+    w = session.query(Wafer).filter_by(lot_id=lot.id, wafer_id=wafer_id).first()
+    if not w:
+        # 嘗試寬鬆比對（去空白）
+        wafer_id_stripped = wafer_id.strip()
+        w = session.query(Wafer).filter(Wafer.lot_id == lot.id, Wafer.wafer_id.like(f"%{wafer_id_stripped}%")).first()
+        if not w:
+            return None
+    dies = session.query(Die).filter_by(wafer_id=w.id).all()
+    if not dies:
+        return None
+    df = pd.DataFrame(
+        [{"x": d.x_coord, "y": d.y_coord, "hard_bin": d.hard_bin} for d in dies if d.x_coord is not None]
+    )
+    if df.empty:
+        return None
+    return _wafer_map_bin_fig(df, f"Wafer map (bin): Lot {lot.lot_id}, Wafer {w.wafer_id}", show_bin_label=(len(df) <= 150))
+
+
+def build_top_fail_pareto_figure(session: Session, level: str, k: int, lot_id: str):
+    """
+    Build top-k fail Pareto figure for a given lot and level ('Die' or 'Wafer').
+    Returns (figure, dataframe) so caller can顯示表格與圖。
+    """
+    lot = session.query(Lot).filter_by(lot_id=lot_id).first()
+    if not lot:
+        return None, None
+    k = max(1, int(k or 5))
+    if level.lower() == "die":
+        fails = session.query(TestItem.test_num, TestItem.test_txt, TestItem.test_type).filter(
+            TestItem.pass_fail == 1
+        ).join(Die).filter(Die.lot_id == lot.id).all()
+        if not fails:
+            return None, None
+        cnt = defaultdict(int)
+        for tn, tt, typ in fails:
+            key = tt or f"Test#{tn}"
+            cnt[key] += 1
+        df = pd.DataFrame(
+            [{"Test": k_, "Fail count": v} for k_, v in sorted(cnt.items(), key=lambda x: -x[1])]
+        ).head(k)
+        if df.empty:
+            return None, None
+        fig = px.bar(df, x="Test", y="Fail count", title=f"Die-level Fail Pareto (top {k})")
+        fig.update_xaxes(tickangle=-45)
+        return fig, df
+    else:
+        wafers = session.query(Wafer).filter_by(lot_id=lot.id).all()
+        if not wafers:
+            return None, None
+        wafer_ids = [w.id for w in wafers]
+        fail_by_test = defaultdict(int)
+        for wid in wafer_ids:
+            dies = session.query(Die.id).filter_by(wafer_id=wid).all()
+            die_ids = [d.id for d in dies]
+            if not die_ids:
+                continue
+            for ti in session.query(TestItem).filter(
+                TestItem.die_id.in_(die_ids), TestItem.pass_fail == 1
+            ).all():
+                key = ti.test_txt or f"Test#{ti.test_num}"
+                fail_by_test[key] += 1
+        df = pd.DataFrame(
+            [{"Test": k_, "Fail count": v} for k_, v in sorted(fail_by_test.items(), key=lambda x: -x[1])]
+        ).head(k)
+        if df.empty:
+            return None, None
+        fig = px.bar(df, x="Test", y="Fail count", title=f"Wafer-level Fail Pareto (top {k})")
+        fig.update_xaxes(tickangle=-45)
+        return fig, df
+
+
 def _lots_query(session: Session, company_id=None, product_id=None, stage_id=None, test_program_id=None, time_start=None, time_end=None):
     """Build Lot query filtered by Company/Product/Stage/TestProgram and optional lot start_t time range."""
     q = session.query(Lot)
@@ -166,6 +279,99 @@ def _sidebar_filters(session: Session):
         "time_start": st.session_state["filter_time_start"],
         "time_end": st.session_state["filter_time_end"],
     }
+
+
+def _get_filters():
+    """Read current filters from session_state (set by sidebar)."""
+    return {
+        "company_id": st.session_state.get("filter_company_id"),
+        "product_id": st.session_state.get("filter_product_id"),
+        "stage_id": st.session_state.get("filter_stage_id"),
+        "test_program_id": st.session_state.get("filter_test_program_id"),
+        "time_start": st.session_state.get("filter_time_start"),
+        "time_end": st.session_state.get("filter_time_end"),
+    }
+
+
+def call_llm_online(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Online LLM call (OpenAI).
+    Expect LLM to return pure JSON like:
+      {"tool": "lot_pchart", "params": {"lots": ["LOT1","LOT2"]}}
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set in environment.")
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("openai package not installed. Run: pip install openai") from exc
+    client = OpenAI(api_key=api_key)
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0,
+    )
+    content = resp.choices[0].message.content or ""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"LLM 回傳非 JSON 格式：{content}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"LLM 回傳格式錯誤：{data}")
+    return data
+
+
+def call_llm_offline(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Offline LLM placeholder.
+    - 若環境變數 OFFLINE_LLM_URL 設定為本地 HTTP 伺服器，則以 JSON 格式呼叫該端點。
+      預期回傳內容為 JSON: {"tool": "...", "params": {...}}。
+    - 若未設定，則用簡單規則從問題文字中抓取類似 LOT 名稱，直接回傳 lot_pchart 指令。
+    之後可在此函式內接 HuggingFace / Ollama / vLLM 並支援 fine-tune 後的模型。
+    """
+    offline_url = os.getenv("OFFLINE_LLM_URL")
+    if offline_url:
+        try:
+            import requests  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("requests package not installed. Run: pip install requests") from exc
+        # 將 messages 壓成簡單 prompt 給本地服務
+        prompt_parts = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content", "")
+            prompt_parts.append(f"[{role}]\n{content}")
+        prompt = "\n\n".join(prompt_parts)
+        r = requests.post(offline_url, json={"prompt": prompt}, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        # 若本地模型已直接回傳 JSON，則使用；否則嘗試從 data["output"] 中解析
+        if isinstance(data, dict) and "tool" in data:
+            return data
+        if isinstance(data, dict) and "output" in data:
+            try:
+                parsed = json.loads(data["output"])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        raise RuntimeError(f"Offline LLM 回傳格式錯誤：{data}")
+
+    # 簡單 fallback：嘗試從問題文字中抓 LOT 名稱，組成 lot_pchart 工具呼叫
+    user_text = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_text = str(m.get("content", ""))
+            break
+    # 抓取類似 LOT 名稱的 token（含英數與 -/_）
+    tokens = re.findall(r"[A-Za-z0-9_-]+", user_text)
+    # 過濾掉太短的 token
+    lots = [t for t in tokens if len(t) >= 3]
+    if not lots:
+        raise RuntimeError("離線模式下無法從問題中推斷 LOT 名稱，請明確輸入 LOT ID。")
+    return {"tool": "lot_pchart", "params": {"lots": lots}}
 
 
 def get_session():
@@ -292,7 +498,13 @@ def lot_to_lot(session: Session):
         dies_in_lot = session.query(Die).filter_by(lot_id=lot.id)
         total = dies_in_lot.count()
         total_ms = session.query(func.coalesce(func.sum(Die.test_t), 0)).filter_by(lot_id=lot.id).scalar() or 0
-        rows.append({"Lot": lot.lot_id, "Total dies": total, "Part type": lot.part_typ or "-", "Total test time (ms)": total_ms, "Lot start": lot.start_t.strftime("%Y-%m-%d %H:%M") if lot.start_t else "-"})
+        rows.append({
+            "Lot": lot.lot_id,
+            "Total dies": total,
+            "Part type": lot.part_typ or "-",
+            "Total test time (ms)": total_ms,
+            "Lot start": lot.start_t.strftime("%Y-%m-%d %H:%M") if lot.start_t else "-",
+        })
     df = pd.DataFrame(rows)
     if df.empty:
         return
@@ -946,6 +1158,100 @@ def custom_query(session: Session):
             run_sql(df_placeholder, session, sql)
 
 
+def llm_assistant(session: Session):
+    st.subheader("LLM Assistant (experimental)")
+    backend = st.radio("Backend", ["Online (cloud LLM)", "Offline (local LLM)"], horizontal=True)
+    question = st.text_area(
+        "請輸入問題，例如：幫我畫 LOT1 與 LOT2 的 p-chart，或：列出 LOT1 的 top5 die-level fail pareto，或：畫 LOT1 wafer 01 的 wafer map",
+        height=100,
+    )
+    if st.button("Run", type="primary"):
+        if not question.strip():
+            st.warning("請先輸入問題。")
+            return
+        system_prompt = (
+            "你是 STDF/良率分析助理。"
+            "目前支援以下三個工具（請依需求選一個使用）：\n"
+            "1) lot_pchart: 畫多個 Lot 的不良率 p-chart。\n"
+            "   參數: {\"lots\": [\"LOT1\",\"LOT2\", ...]}\n"
+            "2) wafer_map: 畫某個 Lot 的某一片 wafer map（以 hard bin 著色）。\n"
+            "   參數: {\"lot\": \"LOT1\", \"wafer\": \"01\"}\n"
+            "3) top_fail_pareto: 列出某 Lot 的 top-k fail pareto，level 可為 \"Die\" 或 \"Wafer\"。\n"
+            "   參數: {\"level\": \"Die\" 或 \"Wafer\", \"k\": 5, \"lot\": \"LOT1\"}\n"
+            "請根據使用者問題，選擇一個最適合的工具與參數，然後輸出『純 JSON』，"
+            "格式嚴格為：{\"tool\":\"lot_pchart\",\"params\":{\"lots\":[\"LOT1\",\"LOT2\"]}} 這一型態。"
+            "不要加任何多餘文字、註解或說明，只能輸出一個 JSON 物件。"
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ]
+        try:
+            if backend.startswith("Online"):
+                data = call_llm_online(messages)
+            else:
+                data = call_llm_offline(messages)
+        except Exception as e:
+            st.error(str(e))
+            return
+        if not isinstance(data, dict) or "tool" not in data:
+            st.warning(f"LLM 回傳格式不正確：{data}")
+            return
+        # 紀錄 log 以利未來 fine-tune
+        try:
+            log_entry = {
+                "question": question,
+                "backend": backend,
+                "parsed": data,
+                "ts": datetime.utcnow().isoformat(),
+            }
+            log_path = Path("llm_logs.jsonl")
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+        tool = data.get("tool")
+        params = data.get("params") or {}
+        if tool == "lot_pchart":
+            lots = params.get("lots") or []
+            if not isinstance(lots, list) or not lots:
+                st.warning("lot_pchart 的 lots 參數為空，請重新描述問題並包含 LOT ID。")
+                return
+            fig = build_lot_pchart_figure(session, lots)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("找不到對應的 lots 或沒有足夠資料畫 p-chart。")
+        elif tool == "wafer_map":
+            lot_id = params.get("lot")
+            wafer = params.get("wafer")
+            if not lot_id or not wafer:
+                st.warning("wafer_map 需要參數 lot 與 wafer。")
+                return
+            fig = build_wafer_map_figure(session, str(lot_id), str(wafer))
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("找不到對應的 lot/wafer 或沒有足夠資料畫 wafer map。")
+        elif tool == "top_fail_pareto":
+            level = params.get("level") or "Die"
+            lot_id = params.get("lot")
+            k = params.get("k", 5)
+            if not lot_id:
+                st.warning("top_fail_pareto 需要參數 lot。")
+                return
+            fig, df = build_top_fail_pareto_figure(session, str(level), int(k), str(lot_id))
+            if df is not None and not df.empty:
+                st.dataframe(df, use_container_width=True)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            elif df is None or df.empty:
+                st.info("沒有足夠的 fail 資料可產生 Pareto 圖。")
+        else:
+            st.warning(f"目前不支援工具：{tool}")
+
+
 def main():
     st.set_page_config(page_title="STDF Dashboard", layout="wide")
     st.title("STDF Database Dashboard")
@@ -965,6 +1271,7 @@ def main():
             "TestSuite→TestItem",
             "Bin Summary",
             "Equipment",
+            "LLM Assistant",
             "Custom SQL",
         ],
         label_visibility="collapsed",
@@ -987,6 +1294,8 @@ def main():
         bin_summary(session)
     elif page == "Equipment":
         equipment_comparison(session)
+    elif page == "LLM Assistant":
+        llm_assistant(session)
     else:
         custom_query(session)
     session.close()
