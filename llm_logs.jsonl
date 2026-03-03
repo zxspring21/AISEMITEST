@@ -1,0 +1,8 @@
+{"question": "幫我畫LOT1與LOT2的p-chart", "backend": "Ollama (local)", "parsed": {"tool": "lot_pchart", "params": {"lots": ["LOT1", "LOT2"]}}, "ts": "2026-03-03T00:34:39.999100"}
+{"question": "幫我畫LOT1 p-chart", "backend": "Ollama (local)", "parsed": {"tool": "lot_pchart", "params": {"lots": ["LOT1"]}}, "ts": "2026-03-03T00:34:48.127202"}
+{"question": "畫出pchart\n", "backend": "Ollama (local)", "parsed": {"tool": "lot_pchart", "params": {"lots": ["LOT1", "LOT2", "LOT3"]}}, "ts": "2026-03-03T00:35:53.629337"}
+{"question": "畫出waferMap\n", "backend": "Ollama (local)", "parsed": {"tool": "wafer_map", "params": {"lot": "LOT1", "wafer": "01"}}, "ts": "2026-03-03T00:36:03.785628"}
+{"question": "列出LOT1的top5 die-level fail pareto\n", "backend": "Ollama (local)", "parsed": {"tool": "top_fail_pareto", "params": {"level": "Die", "k": 5, "lot": "LOT1"}}, "ts": "2026-03-03T00:36:26.541318"}
+{"question": "畫W118892的p-chart", "backend": "Ollama (local)", "parsed": {"tool": "lot_pchart", "params": {"lots": ["W118892"]}}, "ts": "2026-03-03T00:37:21.118562"}
+{"question": "畫W118892的wafermap", "backend": "Ollama (local)", "parsed": {"tool": "wafer_map", "params": {"lot": "W118892", "wafer": "01"}}, "ts": "2026-03-03T00:37:43.746616"}
+{"question": "畫W118892的top5 die-level fail Pareto", "backend": "Ollama (local)", "parsed": {"tool": "top_fail_pareto", "params": {"level": "Die", "k": 5, "lot": "W118892"}}, "ts": "2026-03-03T00:38:01.920047"}

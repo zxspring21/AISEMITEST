@@ -179,6 +179,24 @@
 
 ---
 
+## 11. LLM 助理（常駐右側）
+
+**功能**：LLM 助理對話框**常駐在畫面右側**，不論在 Dashboard、Lot-to-Lot、Wafer-to-Wafer 等任一頁面，都可透過右側對話框用自然語言取得 p-chart、wafer map、fail pareto、wafer 差異比較或測試值熱力圖。
+
+**可做什麼**：
+- 選擇 **Backend**：**Online (cloud LLM)**（需設定 `OPENAI_API_KEY`）、**Ollama (local)**（本機已安裝 [Ollama](https://ollama.com) 時選此項，預設連線 `http://localhost:11434`，可設定 `OLLAMA_BASE_URL`、`OLLAMA_MODEL`）、或 **Offline (other)**（可設定 `OFFLINE_LLM_URL` 或使用內建簡易推斷）。
+- 在右側輸入問題後點 **送出**，系統會請 LLM 回傳一個 JSON 工具指令，再依指令執行並在右側區塊顯示圖表與結果；對話歷史會保留，方便連續問答。
+- 目前支援五種工具：
+  1. **lot_pchart**：畫多個 Lot 的不良率 p-chart（參數：`lots`）。
+  2. **wafer_map**：畫某 Lot 某片 wafer 的 bin 分布圖（參數：`lot`, `wafer`）。
+  3. **top_fail_pareto**：某 Lot 的 top-k fail pareto，Die 或 Wafer 層級（參數：`lot`, `level`, `k`）。
+  4. **wafer_diff**：比較同一 Lot 內兩片 wafer 的 bin 差異，左/右 wafer map ＋ 差異位置圖（參數：`lot`, `wafer_left`, `wafer_right`）。
+  5. **test_heatmap**：某片 wafer 上某個 PTR 測試的量測值熱力圖（參數：`lot`, `wafer`, `test` 為測試名稱或編號）。
+
+**目的**：用口語化問題快速產出 p-chart、wafer map、Pareto、wafer 差異與測試熱力圖，適合探索性分析。
+
+---
+
 ## 名詞對照（UI 常見用語）
 
 | UI 用語 | 說明 |
@@ -191,6 +209,8 @@
 | **Select test (wafer map by value)** (Die-to-Die) | 選擇一個 PTR 測試，Wafer map 依該測試的**量測值**著色，觀察空間分布。 |
 | **Same / Different** (TestItem comparison) | 所選多片 Wafer 上，該 TestItem 的 pass/fail 率與（PTR）均值是否一致：Same = 一致，Different = 有差異。 |
 | **p-Chart** | 以子組（Lot 或 Wafer）為橫軸、不良率為縱軸的管制圖；UCL/LCL = p̄ ± 3σ。 |
+| **wafer_diff** (LLM) | 比較同一 Lot 內兩片 wafer 的 bin 差異，產出左/右 wafer map 與差異位置圖。 |
+| **test_heatmap** (LLM) | 某片 wafer 上某 PTR 測試的量測值熱力圖（依 X,Y 著色）。 |
 
 ---
 
@@ -202,3 +222,4 @@
 4. **Die 層級**：Die-to-Die 選 Wafer，看 Bin map 與參數著色 map。
 5. **失敗分析**：Fail Pareto 選 Lot 與 Die/Wafer level，看測試與 Bin Pareto。
 6. **結構與設備**：TestSuite→TestItem、Bin Summary、Equipment 做結構與設備檢視。
+7. **自然語言查圖**：使用**右側常駐的 LLM 助理**輸入問題（如「比較 LOT1 的 wafer 01 和 02」「畫 LOT1 wafer 01 的某測試熱力圖」），由 LLM 選工具並在右側產出圖表。

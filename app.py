@@ -202,6 +202,132 @@ def build_top_fail_pareto_figure(session: Session, level: str, k: int, lot_id: s
         return fig, df
 
 
+def _resolve_wafer(session: Session, lot: Lot, wafer_id: str):
+    """Resolve wafer_id string to Wafer record (exact or like match)."""
+    w = session.query(Wafer).filter_by(lot_id=lot.id, wafer_id=wafer_id.strip()).first()
+    if w:
+        return w
+    w = session.query(Wafer).filter(
+        Wafer.lot_id == lot.id,
+        Wafer.wafer_id.like(f"%{wafer_id.strip()}%"),
+    ).first()
+    return w
+
+
+def build_wafer_to_wafer_diff(session: Session, lot_id: str, wafer_id_left: str, wafer_id_right: str):
+    """
+    Build multi-wafer diff: left wafer map, right wafer map, diff-only map (bin differs).
+    Returns dict: left_fig, right_fig, diff_fig, diff_count (or None entries on error).
+    """
+    lot = session.query(Lot).filter_by(lot_id=lot_id).first()
+    if not lot:
+        return {"left_fig": None, "right_fig": None, "diff_fig": None, "diff_count": 0}
+    w_left = _resolve_wafer(session, lot, wafer_id_left)
+    w_right = _resolve_wafer(session, lot, wafer_id_right)
+    if not w_left or not w_right:
+        return {"left_fig": None, "right_fig": None, "diff_fig": None, "diff_count": 0}
+    left_id, right_id = w_left.id, w_right.id
+    wafer_ids = [left_id, right_id]
+    data_by_wafer = {}
+    for wid in wafer_ids:
+        dies = session.query(Die).filter_by(wafer_id=wid).all()
+        dmap = {}
+        for d in dies:
+            if d.x_coord is not None and d.y_coord is not None:
+                dmap[(d.x_coord, d.y_coord)] = d.hard_bin
+        data_by_wafer[wid] = dmap
+    all_xy = set()
+    for dmap in data_by_wafer.values():
+        all_xy.update(dmap.keys())
+    diff_xy = []
+    for xy in all_xy:
+        b1 = data_by_wafer[left_id].get(xy)
+        b2 = data_by_wafer[right_id].get(xy)
+        if str(b1) != str(b2):
+            diff_xy.append(xy)
+    dies_left = session.query(Die).filter_by(wafer_id=left_id).all()
+    df_left = pd.DataFrame([
+        {"x": d.x_coord, "y": d.y_coord, "hard_bin": d.hard_bin}
+        for d in dies_left if d.x_coord is not None
+    ])
+    dies_right = session.query(Die).filter_by(wafer_id=right_id).all()
+    df_right = pd.DataFrame([
+        {"x": d.x_coord, "y": d.y_coord, "hard_bin": d.hard_bin}
+        for d in dies_right if d.x_coord is not None
+    ])
+    left_fig = _wafer_map_bin_fig(df_left, f"Left: {w_left.wafer_id}", show_bin_label=False, highlight_xy=diff_xy)
+    right_fig = _wafer_map_bin_fig(df_right, f"Right: {w_right.wafer_id}", show_bin_label=False, highlight_xy=diff_xy)
+    diff_fig = None
+    if diff_xy:
+        df_diff = pd.DataFrame([{"x": x, "y": y} for x, y in diff_xy])
+        diff_fig = px.scatter(
+            df_diff, x="x", y="y",
+            title=f"Positions where bin differs ({len(diff_xy)} dies)",
+            labels={"x": "X", "y": "Y"},
+        )
+        diff_fig.update_traces(marker=dict(size=12, color="red", symbol="x-open"))
+        diff_fig.update_layout(yaxis=dict(scaleanchor="x", scaleratio=1), height=350)
+    return {"left_fig": left_fig, "right_fig": right_fig, "diff_fig": diff_fig, "diff_count": len(diff_xy)}
+
+
+def build_test_value_heatmap_figure(session: Session, lot_id: str, wafer_id: str, test_identifier):
+    """
+    Build wafer map colored by a PTR test value (heatmap style).
+    test_identifier: test number (int) or test name (str). Used by LLM assistant.
+    """
+    lot = session.query(Lot).filter_by(lot_id=lot_id).first()
+    if not lot:
+        return None
+    w = _resolve_wafer(session, lot, wafer_id)
+    if not w:
+        return None
+    # Resolve test: by number or by name
+    try:
+        test_num = int(test_identifier)
+    except (TypeError, ValueError):
+        test_num = None
+    if test_num is not None:
+        rows = session.query(Die.x_coord, Die.y_coord, TestItem.result).join(
+            TestItem, TestItem.die_id == Die.id
+        ).filter(
+            Die.wafer_id == w.id,
+            TestItem.test_num == test_num,
+            TestItem.test_type == "PTR",
+            TestItem.result != None,
+        ).all()
+        test_name = f"Test#{test_num}"
+    else:
+        # Match by test_txt (contains or equals)
+        t = session.query(TestItem.test_num, TestItem.test_txt).join(Die).filter(
+            Die.wafer_id == w.id,
+            TestItem.test_type == "PTR",
+            TestItem.result != None,
+        ).all()
+        needle = str(test_identifier).strip()
+        match = next((x for x in t if (x[1] or "").strip() == needle or (needle in (x[1] or ""))), None)
+        if not match:
+            return None
+        test_num, test_name = match[0], (match[1] or f"Test#{match[0]}").strip()
+        rows = session.query(Die.x_coord, Die.y_coord, TestItem.result).join(
+            TestItem, TestItem.die_id == Die.id
+        ).filter(
+            Die.wafer_id == w.id,
+            TestItem.test_num == test_num,
+            TestItem.test_type == "PTR",
+            TestItem.result != None,
+        ).all()
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=["x", "y", "result"])
+    fig = px.scatter(
+        df, x="x", y="y", color="result",
+        title=f"Test value heatmap: {test_name} (Lot {lot_id}, Wafer {w.wafer_id})",
+        color_continuous_scale="Viridis",
+    )
+    fig.update_layout(yaxis=dict(scaleanchor="x", scaleratio=1), height=450)
+    return fig
+
+
 def _lots_query(session: Session, company_id=None, product_id=None, stage_id=None, test_program_id=None, time_start=None, time_end=None):
     """Build Lot query filtered by Company/Product/Stage/TestProgram and optional lot start_t time range."""
     q = session.query(Lot)
@@ -372,6 +498,65 @@ def call_llm_offline(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not lots:
         raise RuntimeError("離線模式下無法從問題中推斷 LOT 名稱，請明確輸入 LOT ID。")
     return {"tool": "lot_pchart", "params": {"lots": lots}}
+
+
+def _extract_json_from_llm_content(content: str) -> dict:
+    """Parse LLM response: pure JSON or ```json ... ``` block."""
+    content = (content or "").strip()
+    # 嘗試直接解析
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    # 嘗試從 markdown 程式碼區塊取出
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    # 嘗試找第一個 { ... } 區塊
+    m = re.search(r"\{[\s\S]*\}", content)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+    raise RuntimeError(f"無法從 LLM 回傳中解析 JSON：{content[:200]}...")
+
+
+def call_llm_ollama(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    與本機 Ollama 互動。需先安裝並啟動 Ollama（預設 http://localhost:11434）。
+    環境變數：OLLAMA_BASE_URL（預設 http://localhost:11434）、OLLAMA_MODEL（預設 llama3.2）。
+    要求 Ollama 回傳純 JSON：{"tool": "...", "params": {...}}。
+    """
+    try:
+        import requests  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("請安裝 requests：pip install requests") from exc
+    base = (os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+    # model = os.getenv("OLLAMA_MODEL", "llama3.2")
+    model = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+    url = f"{base}/api/chat"
+    payload = {"model": model, "messages": messages, "stream": False}
+    try:
+        r = requests.post(url, json=payload, timeout=120)
+        r.raise_for_status()
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            f"無法連線至 Ollama（{base}）。請確認已安裝並啟動 Ollama（例如終端執行 ollama serve）。"
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError("Ollama 回應逾時，請稍後再試或換較小模型。") from exc
+    except requests.exceptions.HTTPError as exc:
+        raise RuntimeError(f"Ollama 回傳錯誤：{r.status_code} {r.text[:200]}") from exc
+    data = r.json()
+    content = (data.get("message") or {}).get("content") or ""
+    parsed = _extract_json_from_llm_content(content)
+    if not isinstance(parsed, dict) or "tool" not in parsed:
+        raise RuntimeError(f"Ollama 回傳格式須為 {{\"tool\": \"...\", \"params\": {{...}}}}：{parsed}")
+    return parsed
 
 
 def get_session():
@@ -1158,11 +1343,180 @@ def custom_query(session: Session):
             run_sql(df_placeholder, session, sql)
 
 
+def _execute_llm_tool_display(session: Session, tool: str, params: dict) -> bool:
+    """
+    執行 LLM 工具並在當前 context 顯示圖表/表格。回傳是否成功顯示內容。
+    """
+    params = params or {}
+    if tool == "lot_pchart":
+        lots = params.get("lots") or []
+        if not isinstance(lots, list) or not lots:
+            st.caption("lot_pchart 的 lots 參數為空。")
+            return False
+        fig = build_lot_pchart_figure(session, lots)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+            return True
+        st.caption("找不到對應的 lots 或沒有足夠資料。")
+        return False
+    elif tool == "wafer_map":
+        lot_id = params.get("lot")
+        wafer = params.get("wafer")
+        if not lot_id or not wafer:
+            st.caption("wafer_map 需要 lot、wafer。")
+            return False
+        fig = build_wafer_map_figure(session, str(lot_id), str(wafer))
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+            return True
+        st.caption("找不到對應的 lot/wafer。")
+        return False
+    elif tool == "top_fail_pareto":
+        level = params.get("level") or "Die"
+        lot_id = params.get("lot")
+        k = params.get("k", 5)
+        if not lot_id:
+            st.caption("top_fail_pareto 需要 lot。")
+            return False
+        fig, df = build_top_fail_pareto_figure(session, str(level), int(k), str(lot_id))
+        if df is not None and not df.empty:
+            st.dataframe(df, use_container_width=True)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+            return True
+        st.caption("沒有足夠的 fail 資料。")
+        return False
+    elif tool == "wafer_diff":
+        lot_id = params.get("lot")
+        wafer_left = params.get("wafer_left")
+        wafer_right = params.get("wafer_right")
+        if not lot_id or not wafer_left or not wafer_right:
+            st.caption("wafer_diff 需要 lot、wafer_left、wafer_right。")
+            return False
+        out = build_wafer_to_wafer_diff(session, str(lot_id), str(wafer_left), str(wafer_right))
+        st.caption(f"**Bin 差異 die 數：** {out['diff_count']}")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if out["left_fig"]:
+                st.plotly_chart(out["left_fig"], use_container_width=True)
+        with col_b:
+            if out["right_fig"]:
+                st.plotly_chart(out["right_fig"], use_container_width=True)
+        if out["diff_fig"]:
+            st.plotly_chart(out["diff_fig"], use_container_width=True)
+        return bool(out["left_fig"] or out["right_fig"])
+    elif tool == "test_heatmap":
+        lot_id = params.get("lot")
+        wafer = params.get("wafer")
+        test = params.get("test")
+        if not lot_id or not wafer or test is None:
+            st.caption("test_heatmap 需要 lot、wafer、test。")
+            return False
+        fig = build_test_value_heatmap_figure(session, str(lot_id), str(wafer), test)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+            return True
+        st.caption("找不到對應的 lot/wafer/測試。")
+        return False
+    else:
+        st.caption(f"不支援工具：{tool}")
+        return False
+
+
+def _llm_system_prompt() -> str:
+    return (
+        "你是 STDF/良率分析助理。"
+        "目前支援以下五個工具（請依需求選一個使用）：\n"
+        "1) lot_pchart: 畫多個 Lot 的不良率 p-chart。\n"
+        "   參數: {\"lots\": [\"LOT1\",\"LOT2\", ...]}\n"
+        "2) wafer_map: 畫某個 Lot 的某一片 wafer map（以 hard bin 著色）。\n"
+        "   參數: {\"lot\": \"LOT1\", \"wafer\": \"01\"}\n"
+        "3) top_fail_pareto: 列出某 Lot 的 top-k fail pareto，level 可為 \"Die\" 或 \"Wafer\"。\n"
+        "   參數: {\"level\": \"Die\" 或 \"Wafer\", \"k\": 5, \"lot\": \"LOT1\"}\n"
+        "4) wafer_diff: 比較同一 Lot 內兩片 wafer 的 bin 差異（左/右 wafer map + 差異位置圖）。\n"
+        "   參數: {\"lot\": \"LOT1\", \"wafer_left\": \"01\", \"wafer_right\": \"02\"}\n"
+        "5) test_heatmap: 某片 wafer 上某個 PTR 測試的量測值熱力圖（依座標著色）。\n"
+        "   參數: {\"lot\": \"LOT1\", \"wafer\": \"01\", \"test\": \"測試名稱\" 或 test_num 數字}\n"
+        "請根據使用者問題，選擇一個最適合的工具與參數，然後輸出『純 JSON』，"
+        "格式嚴格為：{\"tool\":\"工具名\",\"params\":{...}}。不要加任何多餘文字、註解或說明，只能輸出一個 JSON 物件。"
+    )
+
+
+def render_llm_chat_panel(session: Session):
+    """常駐右側的 LLM 對話框：顯示歷史、輸入新問題、呼叫 LLM 並顯示圖表。"""
+    if "llm_chat_history" not in st.session_state:
+        st.session_state["llm_chat_history"] = []
+
+    st.markdown("### LLM 助理")
+    backend = st.radio(
+        "Backend",
+        ["Online (cloud LLM)", "Ollama (local)", "Offline (other)"],
+        horizontal=False,
+        key="llm_panel_backend",
+    )
+
+    # 對話歷史（最近 N 則，避免過長）
+    history = st.session_state["llm_chat_history"]
+    max_show = 20
+    for i, msg in enumerate(history[-max_show:]):
+        if msg.get("role") == "user":
+            st.markdown(f"**您：** {msg.get('content', '')}")
+        elif msg.get("role") == "assistant":
+            if msg.get("tool"):
+                st.caption(f"🔧 {msg['tool']}")
+                _execute_llm_tool_display(session, msg["tool"], msg.get("params") or {})
+            else:
+                st.markdown(f"**助理：** {msg.get('content', '')}")
+        st.markdown("---")
+
+    question = st.text_input("輸入問題", key="llm_chat_input", placeholder="例：畫 LOT1 與 LOT2 的 p-chart")
+    if st.button("送出", key="llm_chat_send"):
+        if not (question or "").strip():
+            st.caption("請輸入問題。")
+        else:
+            st.session_state["llm_chat_history"].append({"role": "user", "content": question.strip()})
+            messages = [
+                {"role": "system", "content": _llm_system_prompt()},
+                {"role": "user", "content": question.strip()},
+            ]
+            try:
+                if backend.startswith("Online"):
+                    data = call_llm_online(messages)
+                elif "Ollama" in backend:
+                    data = call_llm_ollama(messages)
+                else:
+                    data = call_llm_offline(messages)
+            except Exception as e:
+                st.session_state["llm_chat_history"].append({"role": "assistant", "content": f"錯誤：{e}"})
+                st.rerun()
+            if not isinstance(data, dict) or "tool" not in data:
+                st.session_state["llm_chat_history"].append({"role": "assistant", "content": f"回傳格式不正確：{data}"})
+                st.rerun()
+            tool = data.get("tool")
+            params = data.get("params") or {}
+            st.session_state["llm_chat_history"].append({"role": "assistant", "tool": tool, "params": params})
+            try:
+                log_entry = {"question": question, "backend": backend, "parsed": data, "ts": datetime.utcnow().isoformat()}
+                with Path("llm_logs.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+            st.rerun()
+
+
 def llm_assistant(session: Session):
     st.subheader("LLM Assistant (experimental)")
-    backend = st.radio("Backend", ["Online (cloud LLM)", "Offline (local LLM)"], horizontal=True)
+    backend = st.radio(
+        "Backend",
+        ["Online (cloud LLM)", "Ollama (local)", "Offline (other)"],
+        horizontal=True,
+        help="Ollama：本機已安裝 Ollama 時選此項，預設連線 http://localhost:11434。",
+    )
+    if "Ollama" in backend:
+        st.caption("Ollama 預設使用模型 llama3.2；可設定環境變數 OLLAMA_BASE_URL、OLLAMA_MODEL。請先執行 ollama run <model> 確保模型已拉取。")
     question = st.text_area(
-        "請輸入問題，例如：幫我畫 LOT1 與 LOT2 的 p-chart，或：列出 LOT1 的 top5 die-level fail pareto，或：畫 LOT1 wafer 01 的 wafer map",
+        "請輸入問題，例如：幫我畫 LOT1 與 LOT2 的 p-chart；列出 LOT1 的 top5 die-level fail pareto；"
+        "畫 LOT1 wafer 01 的 wafer map；比較 LOT1 的 wafer 01 和 02 的差異；畫 LOT1 wafer 01 的某測試熱力圖",
         height=100,
     )
     if st.button("Run", type="primary"):
@@ -1171,16 +1525,19 @@ def llm_assistant(session: Session):
             return
         system_prompt = (
             "你是 STDF/良率分析助理。"
-            "目前支援以下三個工具（請依需求選一個使用）：\n"
+            "目前支援以下五個工具（請依需求選一個使用）：\n"
             "1) lot_pchart: 畫多個 Lot 的不良率 p-chart。\n"
             "   參數: {\"lots\": [\"LOT1\",\"LOT2\", ...]}\n"
             "2) wafer_map: 畫某個 Lot 的某一片 wafer map（以 hard bin 著色）。\n"
             "   參數: {\"lot\": \"LOT1\", \"wafer\": \"01\"}\n"
             "3) top_fail_pareto: 列出某 Lot 的 top-k fail pareto，level 可為 \"Die\" 或 \"Wafer\"。\n"
             "   參數: {\"level\": \"Die\" 或 \"Wafer\", \"k\": 5, \"lot\": \"LOT1\"}\n"
+            "4) wafer_diff: 比較同一 Lot 內兩片 wafer 的 bin 差異（左/右 wafer map + 差異位置圖）。\n"
+            "   參數: {\"lot\": \"LOT1\", \"wafer_left\": \"01\", \"wafer_right\": \"02\"}\n"
+            "5) test_heatmap: 某片 wafer 上某個 PTR 測試的量測值熱力圖（依座標著色）。\n"
+            "   參數: {\"lot\": \"LOT1\", \"wafer\": \"01\", \"test\": \"測試名稱\" 或 test_num 數字}\n"
             "請根據使用者問題，選擇一個最適合的工具與參數，然後輸出『純 JSON』，"
-            "格式嚴格為：{\"tool\":\"lot_pchart\",\"params\":{\"lots\":[\"LOT1\",\"LOT2\"]}} 這一型態。"
-            "不要加任何多餘文字、註解或說明，只能輸出一個 JSON 物件。"
+            "格式嚴格為：{\"tool\":\"工具名\",\"params\":{...}}。不要加任何多餘文字、註解或說明，只能輸出一個 JSON 物件。"
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1189,6 +1546,8 @@ def llm_assistant(session: Session):
         try:
             if backend.startswith("Online"):
                 data = call_llm_online(messages)
+            elif "Ollama" in backend:
+                data = call_llm_ollama(messages)
             else:
                 data = call_llm_offline(messages)
         except Exception as e:
@@ -1248,6 +1607,41 @@ def llm_assistant(session: Session):
                 st.plotly_chart(fig, use_container_width=True)
             elif df is None or df.empty:
                 st.info("沒有足夠的 fail 資料可產生 Pareto 圖。")
+        elif tool == "wafer_diff":
+            lot_id = params.get("lot")
+            wafer_left = params.get("wafer_left")
+            wafer_right = params.get("wafer_right")
+            if not lot_id or not wafer_left or not wafer_right:
+                st.warning("wafer_diff 需要參數 lot、wafer_left、wafer_right。")
+                return
+            out = build_wafer_to_wafer_diff(session, str(lot_id), str(wafer_left), str(wafer_right))
+            st.caption(f"**Bin 差異 die 數：** {out['diff_count']}")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if out["left_fig"]:
+                    st.plotly_chart(out["left_fig"], use_container_width=True)
+            with col_b:
+                if out["right_fig"]:
+                    st.plotly_chart(out["right_fig"], use_container_width=True)
+            if out["diff_fig"]:
+                st.plotly_chart(out["diff_fig"], use_container_width=True)
+            if not out["left_fig"] and not out["right_fig"]:
+                st.info("找不到對應的 lot/wafer，或沒有足夠資料。")
+        elif tool == "test_heatmap":
+            lot_id = params.get("lot")
+            wafer = params.get("wafer")
+            test = params.get("test")
+            if not lot_id or not wafer:
+                st.warning("test_heatmap 需要參數 lot、wafer；test 可為測試名稱或 test number。")
+                return
+            if test is None:
+                st.warning("test_heatmap 需要參數 test（測試名稱或編號）。")
+                return
+            fig = build_test_value_heatmap_figure(session, str(lot_id), str(wafer), test)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("找不到對應的 lot/wafer/測試或沒有量測值。")
         else:
             st.warning(f"目前不支援工具：{tool}")
 
@@ -1271,33 +1665,35 @@ def main():
             "TestSuite→TestItem",
             "Bin Summary",
             "Equipment",
-            "LLM Assistant",
             "Custom SQL",
         ],
         label_visibility="collapsed",
     )
-    if page == "Dashboard":
-        dashboard_home(session)
-    elif page == "Load STDF":
-        load_stdf_ui()
-    elif page == "Lot-to-Lot":
-        lot_to_lot(session)
-    elif page == "Wafer-to-Wafer":
-        wafer_to_wafer(session)
-    elif page == "Die-to-Die":
-        die_to_die(session)
-    elif page == "Fail Pareto":
-        fail_pareto(session)
-    elif page == "TestSuite→TestItem":
-        test_suite_items(session)
-    elif page == "Bin Summary":
-        bin_summary(session)
-    elif page == "Equipment":
-        equipment_comparison(session)
-    elif page == "LLM Assistant":
-        llm_assistant(session)
-    else:
-        custom_query(session)
+    # 左側主內容（約 72%）、右側常駐 LLM 對話框（約 28%）
+    col_main, col_chat = st.columns([0.72, 0.28])
+    with col_main:
+        if page == "Dashboard":
+            dashboard_home(session)
+        elif page == "Load STDF":
+            load_stdf_ui()
+        elif page == "Lot-to-Lot":
+            lot_to_lot(session)
+        elif page == "Wafer-to-Wafer":
+            wafer_to_wafer(session)
+        elif page == "Die-to-Die":
+            die_to_die(session)
+        elif page == "Fail Pareto":
+            fail_pareto(session)
+        elif page == "TestSuite→TestItem":
+            test_suite_items(session)
+        elif page == "Bin Summary":
+            bin_summary(session)
+        elif page == "Equipment":
+            equipment_comparison(session)
+        else:
+            custom_query(session)
+    with col_chat:
+        render_llm_chat_panel(session)
     session.close()
 
 

@@ -73,6 +73,10 @@ streamlit run app.py
 | `STDF_DEFAULT_COMPANY` | 未指定時的預設 Company |
 | `STDF_DEFAULT_PRODUCT` | 未指定時的預設 Product |
 | `STDF_DEFAULT_STAGE` | 未指定時的預設 Stage |
+| `OPENAI_API_KEY` | LLM Assistant 選 Online 時使用 |
+| `OPENAI_MODEL` | Online 模型名稱，預設 gpt-4.1-mini |
+| `OLLAMA_BASE_URL` | Ollama API 位址，預設 `http://localhost:11434` |
+| `OLLAMA_MODEL` | Ollama 模型名稱，預設 `llama3.2`（需先 `ollama run llama3.2`） |
 
 ## 依賴
 
